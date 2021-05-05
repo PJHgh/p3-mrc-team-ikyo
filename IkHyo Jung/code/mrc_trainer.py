@@ -86,9 +86,9 @@ def get_data(training_args, tokenizer, text_data_path = "/opt/ml/input/data/data
     # squard를 추가한 데이터
     add_squad_ko = False
     # 전처리를 수행한 데이터 
-    preprocessing = False
+    preprocessing = True
     # concat한 데이터
-    concat = True
+    concat = False
 
     if preprocessing:
         text_data = get_pickle("/opt/ml/lastcode/dataset/preprocess_train.pkl")
@@ -193,12 +193,12 @@ def test_one_epoch(epcoh, model, text_data, test_loader, test_dataset, model_arg
         all_start_logits.append(start_logits.detach().cpu().numpy())
         all_end_logits.append(end_logits.detach().cpu().numpy())
 
-        loss = outputs.loss
-        loss_sum += loss.item()*training_args.per_device_train_batch_size
-        sample_num += training_args.per_device_train_batch_size
+        # loss = outputs.loss
+        # loss_sum += loss.item()*training_args.per_device_train_batch_size
+        # sample_num += training_args.per_device_train_batch_size
 
-        description = f"epoch {epoch} loss: {running_loss/sample_num: .4f}"
-        pbar.set_description(description)
+        # description = f"epoch {epoch} loss: {running_loss/sample_num: .4f}"
+        # pbar.set_description(description)
     
     max_len = max(x.shape[1] for x in all_start_logits)
 
@@ -214,7 +214,7 @@ def test_one_epoch(epcoh, model, text_data, test_loader, test_dataset, model_arg
     val_metric = metric.compute(predictions=prediction.predictions, references=prediction.label_ids)
     print(f"    validation data : {val_metric}")
 
-    return loss_sum/sample_num, val_metric
+    return val_metric
 
 def train_one_epoch(epoch, model, optim, scaler, text_data, train_loader, train_dataset, device, data_args, training_args, tokenizer, scheduler=None):
     model.train()
@@ -256,6 +256,8 @@ def train_one_epoch(epoch, model, optim, scaler, text_data, train_loader, train_
     if scheduler is not None:
         scheduler.step()
 
+    return running_loss/sample_num, scheduler
+
 
 def custom_to_mask(batch, tokenizer):
     # mask 적용
@@ -281,9 +283,9 @@ def custom_to_mask(batch, tokenizer):
 def train_mrc(model, optimizer, scaler, text_data, train_loader, test_loader, train_dataset, test_dataset, scheduler, model_args, data_args, training_args, tokenizer, device):
     prev_f1 = 0
     for epoch in range(int(training_args.num_train_epochs)):
-        train_one_epoch(epoch, model, optimizer, scaler, text_data, train_loader,train_dataset, device, data_args, training_args, tokenizer, scheduler)
+        train_loss, train_scheduler = train_one_epoch(epoch, model, optimizer, scaler, text_data, train_loader,train_dataset, device, data_args, training_args, tokenizer, scheduler)
         with torch.no_grad():
-            val_loss, val_metric = test_one_epoch(epoch, model, text_data, test_loader, test_dataset, model_args, data_args, training_args, device)
+            val_metric = test_one_epoch(epoch, model, text_data, test_loader, test_dataset, model_args, data_args, training_args, device)
             if val_metric["f1"] > prev_f1:
                 model_name = model_args.model_name_or_path
                 model_name = model_name.split("/")[-1]
@@ -295,8 +297,8 @@ def train_mrc(model, optimizer, scaler, text_data, train_loader, test_loader, tr
         wandb.log({
         'train/loss' : train_loss,
         'train/learning_rate' : train_scheduler.get_last_lr()[0] if train_scheduler is not None else training_args.learning_rate,
-        'eval/loss' : val_loss,
-        'eval/exact_match' : val_metric['exact_match']
+        'eval/exact_match' : val_metric['exact_match'],
+        'eval/exact_match' : val_metric['f1']
         })
 
 
