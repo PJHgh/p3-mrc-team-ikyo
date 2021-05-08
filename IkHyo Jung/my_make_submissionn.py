@@ -1,19 +1,13 @@
-import logging
-import os
-import sys
-import time
-import json
+import os, sys, time, json, logging, random
 
 import torch
-import random
 import numpy as np
 import pandas as pd
-import os
 
 from tqdm import tqdm
 from datasets import load_metric, load_from_disk, Sequence, Value, Features, Dataset, DatasetDict
 from transformers import DPRContextEncoder, DPRContextEncoderTokenizer, DPRQuestionEncoder, DPRQuestionEncoderTokenizer, AdamW
-from transformers import AutoConfig, AutoModelForQuestionAnswering, AutoTokenizer
+from transformers import AutoConfig,AutoModelForQuestionAnswering, AutoTokenizer, ElectraModel, ElectraTokenizer
 from torch.utils.data import DataLoader, TensorDataset
 
 from transformers import (
@@ -21,7 +15,7 @@ from transformers import (
     EvalPrediction,
     HfArgumentParser,
     TrainingArguments,
-    set_seed,
+    set_seed
 )
 
 from elasticsearch_retrieval import *
@@ -33,6 +27,7 @@ from arguments import (
     ModelArguments,
     DataTrainingArguments,
 )
+
 
 def get_config():
     parser = HfArgumentParser(
@@ -49,48 +44,56 @@ def seed_everything(seed):
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
     torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = True
+    torch.backends.cudnn.becshmark = True
     set_seed(seed)
 
 def get_model(model_args, training_args):
     backbone_name = model_args.model_name_or_path.split("/")[-1][:-3]
+
     tokenizer = AutoTokenizer.from_pretrained(
         backbone_name,
         use_fast=True
     )
     model = torch.load(model_args.model_name_or_path)
 
+    # ko 계열 모델은 AutoClass 사용하는 경우 안좋을 수 있어서 새로 정의
+    if backbone_name == "koelectra-base-v3-discriminator":
+        backbone_name = 'monologg/' + backbone_name
+
+        model = ElectraModel.from_pretrained("monologg/koelectra-base-v3-discriminator")
+        tokenizer = ElectraTokenizer.from_pretrained("monologg/koelectra-base-v3-discriminator")
+
     return tokenizer, model
 
-
-def run_sparse_retrieval(datasets, training_args):
-    retriever = SparseRetrieval(tokenize_fn=tokenize,
+def run_sparde_retrieval(datasets, training_args):
+    retrieval = SparseRetrieval(tokenize_fn=tokenize,
                                 data_path="/opt/ml/input/data/data/",
                                 context_path="wikipedia_documents.json")
 
-    retriever.get_sparse_embedding()
-    # validation set에 대한 예측문장을 가져온다.
-    df = retriever.retrieve(datasets['validation'])
+    retrieval.get_sparse_embedding()
+    # validation set에 대한 예측 문장 가져옴
+    df = retrieval.retrieve(datasets['validation'])
 
-    # faiss retrieval 사용하고싶으면 사용
-    # df = retriever.retrieve_faiss(dataset['validation'])
+    #faiss retrieval 사용
+    # df = retrieval.retrieve_faiss(datasets['validation'])
 
-    if training_args.do_predict: # test data 에 대해선 정답이 없으므로 id question context 로만 데이터셋이 구성됩니다.
+    if training_args.do_predict: # test data에 대해 정답이 없으므로 context, id, question으로만 데이터셋 구성
         f = Features({'context': Value(dtype='string', id=None),
                       'id': Value(dtype='string', id=None),
                       'question': Value(dtype='string', id=None)})
-
-    elif training_args.do_eval: # train data 에 대해선 정답이 존재하므로 id question context answer 로 데이터셋이 구성됩니다.
-        f = Features({'answers': Sequence(feature={'text': Value(dtype='string', id=None), 'answer_start': Value(dtype='int32', id=None)}, length=-1, id=None),
+    elif training_args.do_eval:
+        f = Features({'answer': Sequence(feature={'text': Value(dtype='string', id=None), 'answer_start': Value(dtype='int32', id=None)}, length=-1, id=None),
                       'context': Value(dtype='string', id=None),
                       'id': Value(dtype='string', id=None),
-                      'question': Value(dtype='str  ing', id=None)})
+                      'question': Value(dtype='string', id=None)})
 
-    # 예측문장과 질문을 Dataset으로
+    # 예측 문장과 질문을 Dataset으로
     datasets = DatasetDict({'validation': Dataset.from_pandas(df, features=f)})
+
     return datasets
 
-# dense retrival 사용 함수
+
+# dense retrival 사용 함수(킹종헌 코드 쓸거라 복붙)
 def dpr(text_data):
     with open("/opt/ml/input/data/data/wikipedia_documents.json", "r") as f:
         wiki = json.load(f)
@@ -112,68 +115,68 @@ def dpr(text_data):
         for step, batch in pbar:
             batch = tuple(t.cuda() for t in batch)
 
-            q_inputs = { 
-                "input_ids" : batch[0],
-                "attention_mask" : batch[1],
-                "token_type_ids" : batch[2]
+            q_inputs = {
+                "input_ids": batch[0],
+                "attention_mask": batch[1],
+                "token_type_ids": batch[2]
             }
 
             q_emb = q_model(**q_inputs).pooler_output.to("cpu")
             dot_prod_scores = torch.matmul(q_emb, torch.transpose(wiki_embs, 0, 1))
-            rank = torch.argsort(dot_prod_scores, dim=1 ,descending=True).squeeze()
+            rank = torch.argsort(dot_prod_scores, dim=1, descending=True).squeeze()
 
             tmp = {
-                "question" : text_data["validation"]["question"][step],
-                "id" : text_data["validation"]["id"][step],
-                "context" : contexts[rank[0]]
+                "question": text_data["validation"]["question"][step],
+                "id": text_data["validation"]["id"][step],
+                "context": contexts[rank[0]]
             }
             total.append(tmp)
-    
+
     df = pd.DataFrame(total)
     f = Features({'context': Value(dtype='string', id=None),
-                      'id': Value(dtype='string', id=None),
-                      'question': Value(dtype='string', id=None)})
+                  'id': Value(dtype='string', id=None),
+                  'question': Value(dtype='string', id=None)})
     datasets = DatasetDict({'validation': Dataset.from_pandas(df, features=f)})
 
     return datasets
 
-def run_elastic_retrival(text_data):
+def run_elastic_retrieval(text_data):
     es, index_name = elastic_setting()
     question_texts = text_data["validation"]["question"]
-    total = []
+    total  = []
     scores = []
-    n_results = 5
+    n_results = 1
 
+    # question을 돌면서 context를 뽑아옴
     pbar = tqdm(enumerate(question_texts), total=len(question_texts), position=0, leave=True)
     for step, question_text in pbar:
         context_list = elastic_retrieval(es, index_name, question_text, n_results)
         score = []
         for i in range(len(context_list)):
-            
+
             tmp = {
-                "question" : question_text,
-                "id" : text_data["validation"]["id"][step] + f"_{i}",
+                'question': question_text,
+                'id' : text_data["validation"]["id"][step] + f"_{i}",
                 "context" : context_list[i][0]
             }
-            score.append(context_list[i][1])
+            score.append(context_list[i][0])
             total.append(tmp)
         scores.append(score)
 
     df = pd.DataFrame(total)
     f = Features({'context': Value(dtype='string', id=None),
-                'id': Value(dtype='string', id=None),
-                'question': Value(dtype='string', id=None)})
-    datasets = DatasetDict({'validation': Dataset.from_pandas(df, features=f)})
+                  'id': Value(dtype='string', id=None),
+                  'question': Value(dtype='string', id=None)})
+    datasets = DatasetDict({'validation' : Dataset.from_pandas(df, features=f)})
 
     return datasets, scores
-        
 
 def get_data(training_args, tokenizer, text_data_path = "/opt/ml/input/data/data/test_dataset"):
     text_data = load_from_disk(text_data_path)
-    #text_data = run_sparse_retrieval(text_data, training_args) #sparse_retrieval
-    #text_data = dpr(text_data) #dense retrieval
+    # text_data = run_sparde_retrieval(text_data, training_args) #sparse retrieval
+    # text_data = dpr(text_data) #dense retrieval
 
-    text_data, scores = run_elastic_retrival(text_data) #elasticsearch retrival
+    text_data, scores = run_elastic_retrieval(text_data) #elasticsearch retrieval
     column_names = text_data["validation"].column_names
 
     data_collator = (
@@ -184,12 +187,12 @@ def get_data(training_args, tokenizer, text_data_path = "/opt/ml/input/data/data
 
     data_processor = DataProcessor(tokenizer)
     val_text = text_data["validation"]
-    val_dataset = data_processor.val_tokenizier(val_text, column_names)
-    val_iter = DataLoader(val_dataset, collate_fn = data_collator, batch_size=1)
+    val_dataset = data_processor.val_tokenizer(val_text, column_names)
+    val_iter = DataLoader(val_dataset, collate_fn = data_collator, batch_size = 1)
 
     return text_data, val_iter, val_dataset, scores
 
-def post_processing_function(examples, features, predictions, text_data, data_args, training_args):
+def post_processoing_function(examples, features, predictions, text_data, data_args, training_args):
     predictions = postprocess_qa_predictions(
         examples=examples,
         features=features,
@@ -199,14 +202,13 @@ def post_processing_function(examples, features, predictions, text_data, data_ar
     )
 
     formatted_predictions = [
-        {"id": k, "prediction_text": v} for k, v in predictions.items()
+        {'id': k, 'prediction_text': v} for k, v in predictions.items()
     ]
     if training_args.do_predict:
         return formatted_predictions
-
     elif training_args.do_eval:
         references = [
-            {"id": ex["id"], "answers": ex["answers"]}
+            {'id': ex["id"], 'answers': ex["answers"]}
             for ex in text_data["validation"]
         ]
         return EvalPrediction(predictions=formatted_predictions, label_ids=references)
@@ -214,16 +216,16 @@ def post_processing_function(examples, features, predictions, text_data, data_ar
 def create_and_fill_np_array(start_or_end_logits, dataset, max_len):
     step = 0
 
-    logits_concat = np.full((len(dataset), max_len), -100, dtype=np.float64)
+    logits_concat = np.full((len(dataset), max_len) -100, dtype=np.float64)
 
     for i, output_logit in enumerate(start_or_end_logits):
         batch_size = output_logit.shape[0]
         cols = output_logit.shape[1]
 
         if step + batch_size < len(dataset):
-            logits_concat[step : step + batch_size, :cols] = output_logit
+            logits_concat[step: step + batch_size, :cols] = output_logit
         else:
-            logits_concat[step:, :cols] = output_logit[: len(dataset) - step]
+            logits_concat[step:, :cols] = output_logit[: len(dataset) -step]
 
         step += batch_size
 
@@ -232,17 +234,17 @@ def create_and_fill_np_array(start_or_end_logits, dataset, max_len):
 def predict(model, text_data, test_loader, test_dataset, model_args, data_args, training_args, device):
     metric = load_metric("squad")
     if "xlm" in model_args.model_name_or_path:
-        test_dataset.set_format(type="torch", columns=["attention_mask", "input_ids"])
+        test_dataset.set_format(type="torch", columes=["attention_mask", "input_ids"])
     else:
-        test_dataset.set_format(type="torch", columns=["attention_mask", "input_ids", "token_type_ids"])
+        test_dataset.set_format(type="torch", columes=["attention_mask", "input_ids", "token_type_ids"])
 
     model.eval()
 
     all_start_logits = []
-    all_end_logits = []
+    all_end_logits   = []
 
     t = time.time()
-    
+
     pbar = tqdm(enumerate(test_loader), total=len(test_loader), position=0, leave=True)
     for step, batch in pbar:
         batch = batch.to(device)
@@ -252,19 +254,18 @@ def predict(model, text_data, test_loader, test_dataset, model_args, data_args, 
 
         all_start_logits.append(start_logits.detach().cpu().numpy())
         all_end_logits.append(end_logits.detach().cpu().numpy())
-    
+
     max_len = max(x.shape[1] for x in all_start_logits)
 
     start_logits_concat = create_and_fill_np_array(all_start_logits, test_dataset, max_len)
     end_logits_concat = create_and_fill_np_array(all_end_logits, test_dataset, max_len)
 
     del all_start_logits
-    del all_end_logits
-    
+    del end_logits_concat
+
     test_dataset.set_format(type=None, columns=list(test_dataset.features.keys()))
     output_numpy = (start_logits_concat, end_logits_concat)
-    prediction = post_processing_function(text_data["validation"], test_dataset, output_numpy, text_data, data_args, training_args)
-
+    prediction = post_processoing_function(text_data["validation"], test_dataset, output_numpy, text_data, data_args, training_args)
 
 def make_submission(scores, training_args):
     with open("/opt/ml/lastcode/submission/nbest_predictions.json", "r") as f:
@@ -279,30 +280,29 @@ def make_submission(scores, training_args):
         mrc_id, step = mrc_id_step.split("_")
         if prev_mrc_id != mrc_id:
             if prev_mrc_id is not None:
-                large_step = np.argmax(final_score)
+                large_step = np.argmaw(final_score)
                 prediction[str(prev_mrc_id)] = nbest[prev_mrc_id+f"_{large_step}"][0]["text"]
                 score_step += 1
                 final_score = []
 
             sum_score = sum(scores[score_step])
             prev_mrc_id = mrc_id
-        
+
         # 여기다가 (1 - m) (m)
         final_score.append(nbest[mrc_id_step][0]["probability"] + scores[score_step][int(step)]/sum_score)
-    
+
     with open(training_args.output_dir+f"/final_predictions.json", 'w', encoding='utf-8') as make_file:
         json.dump(prediction, make_file, indent="\t", ensure_ascii=False)
     print(prediction)
 
 
-
 def main():
     model_args, data_args, training_args = get_config()
     seed_everything(training_args.seed)
-    device=torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
-    tokenizer, model  = get_model(model_args, training_args)
-    model.cuda()
+    tokenizer, model = get_model(model_args, training_args)
+    model.to(device)
     text_data, test_loader, test_dataset, scores = get_data(training_args, tokenizer)
     predict(model, text_data, test_loader, test_dataset, model_args, data_args, training_args, device)
 
@@ -310,3 +310,8 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+
+
+

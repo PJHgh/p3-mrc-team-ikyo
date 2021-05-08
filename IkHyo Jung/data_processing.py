@@ -106,7 +106,7 @@ class DataProcessor():
 
         return train_dataset
     
-    def val_tokenzier(self, val_dataset, column_names):
+    def val_tokenizer(self, val_dataset, column_names):
         val_dataset = val_dataset.map(
             self.prepare_validation_features,
             batched=True,
